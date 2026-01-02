@@ -5,7 +5,13 @@
 // disable if you do not want to have online functionality
 #define ENABLE_SERVER
 
-#ifdef ESP32
+#ifdef ARDUINO_NANO_ESP32
+#define PIN_ENABLE 9    // D6
+#define PIN_DATA 38     // D11 (MOSI)
+#define PIN_CLOCK 48    // D13 (SCK)
+#define PIN_LATCH 8     // D5
+#define PIN_BUTTON 5    // D2
+#elif defined(ESP32)
 #define PIN_ENABLE 26
 #define PIN_DATA 27
 #define PIN_CLOCK 14
@@ -30,8 +36,8 @@
 
 #ifdef ENABLE_SERVER
 // https://github.com/nayarsystems/posix_tz_db/blob/master/zones.json
-#define NTP_SERVER "de.pool.ntp.org"
-#define TZ_INFO "CET-1CEST,M3.5.0,M10.5.0/3"
+#define NTP_SERVER "us.pool.ntp.org"
+#define TZ_INFO "MST7MDT,M3.2.0,M11.1.0"
 #endif
 
 #define COLS 16
@@ -42,7 +48,7 @@ constexpr uint8_t MAX_BRIGHTNESS = 255;
 constexpr uint16_t TOTAL_PIXELS = ROWS * COLS;
 
 // set your city or coords (https://github.com/chubin/wttr.in)
-#define WEATHER_LOCATION "Hamburg"
+#define WEATHER_LOCATION "Evergreen, CO"
 
 // name of WiFi created by the device if no known WiFi is available
 #define WIFI_MANAGER_SSID "IKEA"
