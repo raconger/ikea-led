@@ -39,6 +39,9 @@
 #include "plugins/BigClockPlugin.h"
 #include "plugins/ClockPlugin.h"
 #include "plugins/WeatherPlugin.h"
+#ifdef ESP32
+#include "plugins/FlightTrackerPlugin.h"
+#endif
 #endif
 
 #include "asyncwebserver.h"
@@ -185,6 +188,11 @@ void baseSetup()
   pluginManager.addPlugin(new AnimationPlugin());
   pluginManager.addPlugin(new DDPPlugin());
   pluginManager.addPlugin(new ArtNetPlugin());
+#ifdef ESP32
+  FlightTrackerPlugin *flightTracker = new FlightTrackerPlugin();
+  pluginManager.addPlugin(flightTracker);
+  flightTracker->registerRoutes(server);
+#endif
 #endif
 
   Screen.clear();
