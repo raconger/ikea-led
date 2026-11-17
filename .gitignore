@@ -5,6 +5,7 @@
 .cache
 compile_commands.json
 secrets.h
+include/home_location.h
 
 # Logs
 logs
