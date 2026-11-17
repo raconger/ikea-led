@@ -28,6 +28,11 @@
 #ifndef FLIGHT_OVERHEAD_MAX_ALT_FT
 #define FLIGHT_OVERHEAD_MAX_ALT_FT 30000
 #endif
+// Every N seconds of radar, feature the nearest not-recently-shown flight
+// (0 disables, leaving only the overhead trigger).
+#ifndef FLIGHT_SPOTLIGHT_SECONDS
+#define FLIGHT_SPOTLIGHT_SECONDS 20
+#endif
 
 class AsyncWebServer;
 
@@ -68,7 +73,8 @@ private:
   enum DisplayState
   {
     RADAR,
-    OVERHEAD_INFO,
+    LOCATE,        // blink the featured plane on the radar
+    OVERHEAD_INFO, // heading arrow + altitude card after the details scroll
   };
 
   // --- shared between fetch task and render loop (guarded by mutex) ---
@@ -96,6 +102,8 @@ private:
   std::string lastShownCallsign;
   uint32_t lastShownAt = 0;
   std::string infoCallsign;
+  uint32_t radarSince = 0;
+  std::map<std::string, uint32_t> featuredAt; // callsign -> millis() last featured
 
   // Frames are composed off-screen and copied in one go: the LED timer ISR
   // reads the live buffer continuously, so clear-then-draw would flicker.
@@ -109,9 +117,12 @@ private:
   void smallDigit(int x, int y, int digit, uint8_t brightness);
   void present();
   const Aircraft *findOverhead(const std::vector<Aircraft> &list, uint32_t now) const;
-  void drawRadar(const std::vector<Aircraft> &list, uint32_t now);
+  const Aircraft *findSpotlight(const std::vector<Aircraft> &list, uint32_t now) const;
+  void drawRadar(const std::vector<Aircraft> &list, uint32_t now, const char *highlight = nullptr);
   void drawInfo(const Aircraft &a);
-  void showOverhead(const Aircraft &a);
+  void feature(const Aircraft &a, uint32_t now);
+  std::string detailsText(const Aircraft &a, uint32_t now);
+  void scrollDetails(const Aircraft &a);
 };
 
 #endif

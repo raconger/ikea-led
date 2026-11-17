@@ -33,6 +33,7 @@
     box-shadow: 0 1px 0 rgba(0,0,0,.05), 0 12px 32px rgba(0,0,0,.18);
   }
   canvas { display: block; width: 100%; aspect-ratio: 1; border-radius: 2px; background: var(--panel); cursor: crosshair; }
+  .now { font: 600 15px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 8px; min-height: 21px; letter-spacing: .02em; overflow-wrap: anywhere; }
   .status { display: flex; gap: 8px; align-items: center; margin-top: 12px; color: var(--muted); font-size: 13px; min-height: 20px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.ok { background: var(--ok); } .dot.err { background: var(--accent); }
@@ -64,12 +65,14 @@
 <main>
   <section>
     <h1>Flights simulator</h1>
-    <p class="sub">The FlightTrackerPlugin logic running against live ADS-B data. Click a flight to preview its overhead card.</p>
+    <p class="sub">The FlightTrackerPlugin logic running against live ADS-B data. Click a flight to feature it now.</p>
     <div class="device"><canvas id="led" width="640" height="640" aria-label="16 by 16 LED matrix"></canvas></div>
     <div class="status"><span class="dot" id="dot"></span><span id="status">Starting…</span></div>
+    <div class="now" id="now" aria-live="polite"></div>
     <div class="card controls">
       <h2>Settings</h2>
       <label>Radar radius <output id="radiusOut"></output><input id="radius" type="range" min="3" max="40" step="1"></label>
+      <label>Spotlight every <output id="spotlightOut"></output><input id="spotlight" type="range" min="0" max="120" step="5"></label>
       <label>Overhead distance <output id="overheadOut"></output><input id="overhead" type="range" min="1" max="10" step="0.5"></label>
       <label>Overhead max altitude <output id="maxAltOut"></output><input id="maxAlt" type="range" min="5000" max="45000" step="1000"></label>
       <label>Device brightness <output id="brightOut"></output><input id="bright" type="range" min="1" max="255" step="1">
@@ -96,7 +99,9 @@ const COLS = 16, ROWS = 16, HOME_X = 8, HOME_Y = 8, DEG = Math.PI / 180;
 const MAX_BRIGHTNESS = 255;
 const FRAME_MS = 50, BASE_INTERVAL_MS = 10000, MAX_INTERVAL_MS = 120000;
 const STALE_MS = 90000, MAX_EXTRAPOLATE_S = 60, INFO_HOLD_MS = 8000;
-const RESHOW_AFTER_MS = 10 * 60 * 1000, ROUTE_LOOKUPS_PER_CYCLE = 2, SCROLL_DELAY_MS = 50;
+const RESHOW_AFTER_MS = 10 * 60 * 1000, ROUTE_LOOKUPS_PER_CYCLE = 3, SCROLL_DELAY_MS = 60;
+const MPH_PER_KNOT = 1.15078;
+const LOCATE_MS = 1600, SPOTLIGHT_REPEAT_MS = 5 * 60 * 1000;
 const PATH_BEHIND_PX = 4, PATH_AHEAD_PX = 3, COMET_TAIL_PX = 2.5, AHEAD_DIMMING = 0.6;
 const PULSE_MS_AT_450KT = 1100, PULSE_MIN_MS = 700, PULSE_MAX_MS = 2600;
 function phaseSeed(callsign) { // FNV-1a, same as firmware
@@ -157,6 +162,8 @@ function smallDigit(x, y, d, b) {
 
 // ---- Display state machine (mirrors FlightTrackerPlugin::loop) --------------
 let state = 'RADAR', stateStartedAt = 0, lastShownCallsign = '', lastShownAt = 0, infoCallsign = '';
+let radarSince = Date.now();
+const featuredAt = new Map();
 let scroll = null; // { text, startedAt } — the firmware blocks in scrollText; here it's a state
 
 function findOverhead(list, now) {
@@ -169,35 +176,72 @@ function findOverhead(list, now) {
   return best;
 }
 
-function overheadText(a) {
+function findSpotlight(list, now) {
+  let best = null, bestDistance = Infinity;
+  for (const a of list) {
+    if (!a.callsign || now - a.positionAt > STALE_MS) continue;
+    const shown = featuredAt.get(a.callsign);
+    if (shown !== undefined && now - shown < SPOTLIGHT_REPEAT_MS) continue;
+    const p = project(a, now);
+    if (Math.abs(p.east) >= cfg.radiusNm || Math.abs(p.north) >= cfg.radiusNm) continue;
+    const d = Math.hypot(p.east, p.north);
+    if (d < bestDistance) { bestDistance = d; best = a; }
+  }
+  return best;
+}
+
+function feature(a, now) {
+  for (const [cs, t] of featuredAt) if (now - t >= SPOTLIGHT_REPEAT_MS) featuredAt.delete(cs);
+  featuredAt.set(a.callsign, now);
+  infoCallsign = a.callsign; state = 'LOCATE'; stateStartedAt = now;
+}
+
+const DIRECTIONS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+function detailsText(a, now) {
   let text = a.callsign;
   const r = routes.get(a.callsign);
   if (r && r.known && r.plausible) text += ` ${r.origin}>${r.destination}`;
   if (a.type) text += ` ${a.type}`;
+  text += ` ${Math.trunc((a.altitude + 50) / 100) * 100}FT ${lround(a.groundSpeed * MPH_PER_KNOT)}MPH`;
+  const p = project(a, now), d = Math.hypot(p.east, p.north);
+  if (d < 1) text += ' OVERHEAD';
+  else {
+    let bearing = Math.atan2(p.east, p.north) / DEG;
+    if (bearing < 0) bearing += 360;
+    text += ` ${lround(d)}NM ${DIRECTIONS[lround(bearing / 45) % 8]}`;
+  }
   return text;
 }
 
-function showOverhead(a, now) {
-  lastShownCallsign = a.callsign; lastShownAt = now; infoCallsign = a.callsign;
-  scroll = { text: overheadText(a), startedAt: now };
-  state = 'SCROLL';
-}
-
 function tick(now) {
+  const featured = infoCallsign ? aircraft.find(x => x.callsign === infoCallsign) : null;
+  if (state === 'LOCATE') {
+    if (!featured) { state = 'RADAR'; radarSince = now; }
+    else if (now - stateStartedAt < LOCATE_MS) { drawRadar(now, featured.callsign); return; }
+    else {
+      scroll = { text: detailsText(featured, now), startedAt: now };
+      setNowShowing(scroll.text);
+      state = 'SCROLL';
+    }
+  }
   if (state === 'SCROLL') {
     if (drawScroll(now)) return;
     state = 'OVERHEAD_INFO'; stateStartedAt = now;
   }
   if (state === 'OVERHEAD_INFO') {
-    const a = aircraft.find(x => x.callsign === infoCallsign);
-    if (now - stateStartedAt < INFO_HOLD_MS && a) { drawInfo(a); return; }
-    state = 'RADAR';
+    if (now - stateStartedAt < INFO_HOLD_MS && featured) { drawInfo(featured); return; }
+    state = 'RADAR'; radarSince = now; setNowShowing('');
   }
   const o = findOverhead(aircraft, now);
   if (o && (lastShownCallsign !== o.callsign || now - lastShownAt > RESHOW_AFTER_MS)) {
-    showOverhead(o, now);
-    drawScroll(now);
+    lastShownCallsign = o.callsign; lastShownAt = now;
+    feature(o, now); drawRadar(now, o.callsign);
     return;
+  }
+  if (cfg.spotlightSeconds > 0 && now - radarSince >= cfg.spotlightSeconds * 1000) {
+    const sp = findSpotlight(aircraft, now);
+    if (sp) { feature(sp, now); drawRadar(now, sp.callsign); return; }
+    radarSince = now;
   }
   drawRadar(now);
 }
@@ -221,8 +265,9 @@ function drawScroll(now) {
   return true;
 }
 
-function drawRadar(now) {
+function drawRadar(now, highlight = null) {
   frame.fill(0);
+  const blinkOn = Math.floor(now / 200) % 2 === 0;
   let anyFresh = false;
   const pixelsPerNm = (COLS / 2) / cfg.radiusNm;
   for (const a of aircraft) {
@@ -230,7 +275,13 @@ function drawRadar(now) {
     anyFresh = true;
     const p = project(a, now);
     const px = HOME_X + p.east * pixelsPerNm, py = HOME_Y - p.north * pixelsPerNm;
-    const b = altitudeBrightness(a.altitude);
+    const x = Math.floor(px), y = Math.floor(py);
+    if (highlight && a.callsign === highlight) {
+      plot(x, y, blinkOn ? MAX_BRIGHTNESS : 60);
+      if (blinkOn) { plot(x - 1, y, 140); plot(x + 1, y, 140); plot(x, y - 1, 140); plot(x, y + 1, 140); }
+      continue;
+    }
+    const b = Math.trunc(altitudeBrightness(a.altitude) / (highlight ? 4 : 1));
     const dirX = Math.sin(a.track * DEG), dirY = -Math.cos(a.track * DEG);
     plot(Math.floor(px - dirX), Math.floor(py - dirY), Math.max(Math.trunc(b / 6), 12));
     // "Ghost rider" pulse sweeping along the flight path
@@ -348,9 +399,9 @@ async function fetchRoute(a) {
 
 async function lookupRoutes() {
   const todo = aircraft
-    .filter(a => a.callsign && a.altitude <= cfg.overheadMaxAltFt && !(a.callsign[0] === 'N' && /\d/.test(a.callsign[1] || '')))
+    .filter(a => /^[A-Z]{3}\d/i.test(a.callsign)) // airline callsigns, not tail numbers
     .map(a => ({ a, d: Math.hypot(a.east, a.north) }))
-    .filter(c => c.d <= cfg.overheadNm * 2.5 && !routes.has(c.a.callsign))
+    .filter(c => c.d <= cfg.radiusNm * 1.42 && !routes.has(c.a.callsign))
     .sort((x, y) => x.d - y.d)
     .slice(0, ROUTE_LOOKUPS_PER_CYCLE);
   for (const { a } of todo) {
@@ -377,6 +428,7 @@ async function fetchLoop() {
 
 // ---- UI -------------------------------------------------------------------
 const $ = id => document.getElementById(id);
+function setNowShowing(text) { $('now').textContent = text; }
 function setStatus(ok, msg) {
   $('dot').className = 'dot ' + (ok ? 'ok' : 'err');
   if (ok && deviceInactive) {
@@ -410,7 +462,7 @@ $('rows').addEventListener('click', async e => {
   const a = tr && aircraft.find(x => x.callsign === tr.dataset.cs && x.callsign);
   if (!a) return;
   if (!routes.has(a.callsign)) { const r = await fetchRoute(a).catch(() => null); if (r) routes.set(a.callsign, r); renderTable(); }
-  showOverhead(a, Date.now());
+  feature(a, Date.now());
 });
 
 canvas.addEventListener('mousemove', e => {
@@ -425,7 +477,7 @@ canvas.addEventListener('mousemove', e => {
   if (!hit) { tip.style.display = 'none'; return; }
   tip.style.display = 'block';
   tip.style.left = (e.clientX + 14) + 'px'; tip.style.top = (e.clientY + 14) + 'px';
-  tip.textContent = `${hit.callsign || '(no callsign)'} ${hit.type} · ${hit.altitude.toLocaleString()} ft · ${Math.round(hit.groundSpeed)} kt`;
+  tip.textContent = `${hit.callsign || '(no callsign)'} ${hit.type} · ${hit.altitude.toLocaleString()} ft · ${Math.round(hit.groundSpeed * MPH_PER_KNOT)} mph`;
 });
 canvas.addEventListener('mouseleave', () => { $('tip').style.display = 'none'; });
 
@@ -451,6 +503,8 @@ async function init() {
   const saved = (() => { try { return parseInt(localStorage.getItem('flightsim.brightness')); } catch { return NaN; } })();
   deviceBrightness = Number.isFinite(saved) ? saved : 255;
   bindSlider('radius', 'radiusNm', v => `${v} nm`);
+  if (cfg.spotlightSeconds === undefined) cfg.spotlightSeconds = 20;
+  bindSlider('spotlight', 'spotlightSeconds', v => v ? `${v} s` : 'off');
   bindSlider('overhead', 'overheadNm', v => `${v} nm`);
   bindSlider('maxAlt', 'overheadMaxAltFt', v => `${v.toLocaleString()} ft`);
   bindSlider('bright', null, v => `${v} / 255`, v => {

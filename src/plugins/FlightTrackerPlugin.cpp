@@ -26,7 +26,11 @@ constexpr float MAX_EXTRAPOLATE_S = 60.0f;
 constexpr uint32_t INFO_HOLD_MS = 8000;
 constexpr uint32_t RESHOW_AFTER_MS = 10UL * 60 * 1000;
 constexpr size_t ROUTE_CACHE_MAX = 64;
-constexpr int ROUTE_LOOKUPS_PER_CYCLE = 2;
+constexpr int ROUTE_LOOKUPS_PER_CYCLE = 3;
+constexpr uint32_t LOCATE_MS = 1600;                  // blink featured plane before details
+constexpr uint32_t SPOTLIGHT_REPEAT_MS = 5UL * 60 * 1000; // don't re-feature a plane sooner
+constexpr int SCROLL_DELAY_MS = 60;
+constexpr float MPH_PER_KNOT = 1.15078f;
 constexpr int HOME_X = COLS / 2;
 constexpr int HOME_Y = ROWS / 2;
 
@@ -140,6 +144,7 @@ void FlightTrackerPlugin::setup()
 {
   state = RADAR;
   lastFrame = 0;
+  radarSince = millis();
   active = true;
 
   // The fetch task lives for the lifetime of the device and idles while the
@@ -292,22 +297,22 @@ void FlightTrackerPlugin::lookupRoutes()
   };
   std::vector<Candidate> todo;
 
-  // Look up routes well before a plane reaches the overhead zone, so the
-  // answer is cached by the time we want to display it.
+  // Look up every airline flight on the radar (nearest first), so routes are
+  // cached by the time a plane is featured.
   xSemaphoreTake(mutex, portMAX_DELAY);
   for (const Aircraft &a : aircraft)
   {
-    if (!a.callsign[0] || a.altitude > FLIGHT_OVERHEAD_MAX_ALT_FT)
-    {
-      continue;
-    }
-    // US tail numbers (N123AB) are private flights without published routes.
-    if (a.callsign[0] == 'N' && isdigit((unsigned char)a.callsign[1]))
+    // Airline callsigns are 3 letters + flight number (UAL493). Tail numbers
+    // like N123AB are private flights without published routes.
+    const char *c = a.callsign;
+    bool airline = isalpha((unsigned char)c[0]) && isalpha((unsigned char)c[1]) &&
+                   isalpha((unsigned char)c[2]) && isdigit((unsigned char)c[3]);
+    if (!airline)
     {
       continue;
     }
     float distance = hypotf(a.east, a.north);
-    if (distance > FLIGHT_OVERHEAD_NM * 2.5f || routeCache.count(a.callsign))
+    if (distance > FLIGHT_RADIUS_NM * 1.42f || routeCache.count(a.callsign))
     {
       continue;
     }
@@ -531,33 +536,188 @@ void FlightTrackerPlugin::loop()
   lastFrame = now;
 
   std::vector<Aircraft> list = snapshot();
+  auto featured = std::find_if(list.begin(), list.end(), [&](const Aircraft &a) {
+    return infoCallsign == a.callsign;
+  });
+  bool featuredPresent = !infoCallsign.empty() && featured != list.end();
+
+  if (state == LOCATE)
+  {
+    if (!featuredPresent)
+    {
+      state = RADAR;
+      radarSince = now;
+    }
+    else if (now - stateStartedAt < LOCATE_MS)
+    {
+      drawRadar(list, now, featured->callsign);
+      return;
+    }
+    else
+    {
+      scrollDetails(*featured); // blocking; moves on to OVERHEAD_INFO
+      return;
+    }
+  }
 
   if (state == OVERHEAD_INFO)
   {
-    auto it = std::find_if(list.begin(), list.end(), [&](const Aircraft &a) {
-      return infoCallsign == a.callsign;
-    });
-    if (now - stateStartedAt < INFO_HOLD_MS && it != list.end())
+    if (now - stateStartedAt < INFO_HOLD_MS && featuredPresent)
     {
-      drawInfo(*it);
+      drawInfo(*featured);
       return;
     }
     state = RADAR;
+    radarSince = now;
   }
 
+  // A plane passing close by always interrupts the radar.
   const Aircraft *overhead = findOverhead(list, now);
   if (overhead &&
       (lastShownCallsign != overhead->callsign || now - lastShownAt > RESHOW_AFTER_MS))
   {
-    showOverhead(*overhead);
+    lastShownCallsign = overhead->callsign;
+    lastShownAt = now;
+    feature(*overhead, now);
+    drawRadar(list, now, overhead->callsign);
     return;
+  }
+
+  // Otherwise, periodically spotlight the nearest flight not shown lately.
+  if (FLIGHT_SPOTLIGHT_SECONDS > 0 && now - radarSince >= FLIGHT_SPOTLIGHT_SECONDS * 1000UL)
+  {
+    const Aircraft *spotlight = findSpotlight(list, now);
+    if (spotlight)
+    {
+      feature(*spotlight, now);
+      drawRadar(list, now, spotlight->callsign);
+      return;
+    }
+    radarSince = now; // nothing eligible: try again next interval
   }
 
   drawRadar(list, now);
 }
 
-void FlightTrackerPlugin::drawRadar(const std::vector<Aircraft> &list, uint32_t now)
+const Aircraft *FlightTrackerPlugin::findSpotlight(const std::vector<Aircraft> &list,
+                                                   uint32_t now) const
 {
+  const Aircraft *best = nullptr;
+  float bestDistance = INFINITY;
+  for (const Aircraft &a : list)
+  {
+    if (!a.callsign[0] || now - a.positionAt > STALE_MS)
+    {
+      continue;
+    }
+    auto shown = featuredAt.find(a.callsign);
+    if (shown != featuredAt.end() && now - shown->second < SPOTLIGHT_REPEAT_MS)
+    {
+      continue;
+    }
+    float east, north;
+    project(a, now, east, north);
+    if (fabsf(east) >= FLIGHT_RADIUS_NM || fabsf(north) >= FLIGHT_RADIUS_NM)
+    {
+      continue; // only planes visible on the radar
+    }
+    float distance = hypotf(east, north);
+    if (distance < bestDistance)
+    {
+      bestDistance = distance;
+      best = &a;
+    }
+  }
+  return best;
+}
+
+void FlightTrackerPlugin::feature(const Aircraft &a, uint32_t now)
+{
+  for (auto it = featuredAt.begin(); it != featuredAt.end();)
+  {
+    it = now - it->second >= SPOTLIGHT_REPEAT_MS ? featuredAt.erase(it) : std::next(it);
+  }
+  featuredAt[a.callsign] = now;
+  infoCallsign = a.callsign;
+  state = LOCATE;
+  stateStartedAt = now;
+}
+
+// e.g. "SWA1759 DEN>LAS B38M 20600FT 472MPH 12NM E"
+std::string FlightTrackerPlugin::detailsText(const Aircraft &a, uint32_t now)
+{
+  std::string text = a.callsign;
+
+  Route route{};
+  bool haveRoute = false;
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  auto it = routeCache.find(a.callsign);
+  if (it != routeCache.end())
+  {
+    route = it->second;
+    haveRoute = true;
+  }
+  xSemaphoreGive(mutex);
+
+  if (haveRoute && route.known && route.plausible)
+  {
+    text += std::string(" ") + route.origin + ">" + route.destination;
+  }
+  if (a.type[0])
+  {
+    text += std::string(" ") + a.type;
+  }
+
+  char buf[32];
+  snprintf(buf,
+           sizeof(buf),
+           " %dFT %dMPH",
+           (a.altitude + 50) / 100 * 100,
+           (int)lroundf(a.groundSpeed * MPH_PER_KNOT));
+  text += buf;
+
+  float east, north;
+  project(a, now, east, north);
+  float distance = hypotf(east, north);
+  if (distance < 1.0f)
+  {
+    text += " OVERHEAD";
+  }
+  else
+  {
+    // Compass direction from home to the plane
+    static const char *const directions[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    float bearing = atan2f(east, north) / DEG;
+    int sector = (int)lroundf((bearing < 0 ? bearing + 360 : bearing) / 45.0f) % 8;
+    snprintf(buf, sizeof(buf), " %dNM %s", (int)lroundf(distance), directions[sector]);
+    text += buf;
+  }
+  return text;
+}
+
+void FlightTrackerPlugin::scrollDetails(const Aircraft &a)
+{
+  std::string text = detailsText(a, millis());
+  Serial.printf("[flights] featuring: %s\n", text.c_str());
+
+  Screen.scrollText(text, SCROLL_DELAY_MS); // blocking, ~0.36 s per character
+
+  if (!active)
+  {
+    return; // user switched plugins mid-scroll
+  }
+  state = OVERHEAD_INFO;
+  stateStartedAt = millis();
+}
+
+void FlightTrackerPlugin::drawRadar(const std::vector<Aircraft> &list,
+                                    uint32_t now,
+                                    const char *highlight)
+{
+  // While locating a featured plane it blinks with a + marker and every other
+  // plane drops to a quarter of its brightness.
+  bool blinkOn = (now / 200) % 2 == 0;
+
   memset(frame, 0, sizeof(frame));
 
   bool anyFresh = false;
@@ -576,7 +736,21 @@ void FlightTrackerPlugin::drawRadar(const std::vector<Aircraft> &list, uint32_t 
     float px = HOME_X + east * pixelsPerNm;
     float py = HOME_Y - north * pixelsPerNm; // screen y grows downward
 
-    uint8_t brightness = altitudeBrightness(a.altitude);
+    int x = (int)floorf(px), y = (int)floorf(py);
+    if (highlight && strcmp(a.callsign, highlight) == 0)
+    {
+      plot(x, y, blinkOn ? MAX_BRIGHTNESS : 60);
+      if (blinkOn)
+      {
+        plot(x - 1, y, 140);
+        plot(x + 1, y, 140);
+        plot(x, y - 1, 140);
+        plot(x, y + 1, 140);
+      }
+      continue;
+    }
+
+    uint8_t brightness = altitudeBrightness(a.altitude) / (highlight ? 4 : 1);
     float dirX = sinf(a.track * DEG), dirY = -cosf(a.track * DEG); // screen y grows downward
 
     // Faint fixed tail so heading is readable between pulses.
@@ -625,45 +799,6 @@ void FlightTrackerPlugin::drawRadar(const std::vector<Aircraft> &list, uint32_t 
   plot(HOME_X, HOME_Y, pulse);
 
   present();
-}
-
-void FlightTrackerPlugin::showOverhead(const Aircraft &a)
-{
-  std::string text = a.callsign;
-
-  Route route{};
-  bool haveRoute = false;
-  xSemaphoreTake(mutex, portMAX_DELAY);
-  auto it = routeCache.find(a.callsign);
-  if (it != routeCache.end())
-  {
-    route = it->second;
-    haveRoute = true;
-  }
-  xSemaphoreGive(mutex);
-
-  if (haveRoute && route.known && route.plausible)
-  {
-    text += std::string(" ") + route.origin + ">" + route.destination;
-  }
-  if (a.type[0])
-  {
-    text += std::string(" ") + a.type;
-  }
-
-  Serial.printf("[flights] overhead: %s\n", text.c_str());
-  lastShownCallsign = a.callsign;
-  lastShownAt = millis();
-  infoCallsign = a.callsign;
-
-  Screen.scrollText(text, 50); // blocking, ~5 s
-
-  if (!active)
-  {
-    return; // user switched plugins mid-scroll
-  }
-  state = OVERHEAD_INFO;
-  stateStartedAt = millis();
 }
 
 // Info card after the scroll:
@@ -743,6 +878,7 @@ void FlightTrackerPlugin::registerRoutes(AsyncWebServer &server)
     config["radiusNm"] = FLIGHT_RADIUS_NM;
     config["overheadNm"] = FLIGHT_OVERHEAD_NM;
     config["overheadMaxAltFt"] = FLIGHT_OVERHEAD_MAX_ALT_FT;
+    config["spotlightSeconds"] = FLIGHT_SPOTLIGHT_SECONDS;
 
     JsonObject system = doc["glyphs"]["system"].to<JsonObject>();
     system["sizeX"] = fonts[0].sizeX;

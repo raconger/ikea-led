@@ -31,13 +31,14 @@ CONFIG_KEYS = {
     "FLIGHT_RADIUS_NM": "radiusNm",
     "FLIGHT_OVERHEAD_NM": "overheadNm",
     "FLIGHT_OVERHEAD_MAX_ALT_FT": "overheadMaxAltFt",
+    "FLIGHT_SPOTLIGHT_SECONDS": "spotlightSeconds",
 }
 
 
 def read_config():
     # Same fallbacks as include/plugins/FlightTrackerPlugin.h
     config = {"lat": 39.8561, "lon": -104.6737, "radiusNm": 15.0,
-              "overheadNm": 4.0, "overheadMaxAltFt": 30000}
+              "overheadNm": 4.0, "overheadMaxAltFt": 30000, "spotlightSeconds": 20}
     path = ROOT / "include" / "home_location.h"
     if path.exists():
         for name, value in re.findall(r"#define\s+(\w+)\s+(-?[\d.]+)f?", path.read_text()):
